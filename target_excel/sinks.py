@@ -62,6 +62,16 @@ class FallbackSink(ExcelSink):
         return {"state_updates": results}
 
 
+    def convert_row(self, header, record):
+        # NOTE: when we post the records, they must be in the same order as the header to avoid mismatches
+        converted_row = []
+
+        for c in header:
+            converted_row.append(record.get(c, ""))
+
+        return converted_row
+
+
     def make_batch_request(self, records):
         header = list(records[0].keys())
 
@@ -87,8 +97,47 @@ class FallbackSink(ExcelSink):
         else:
             self.table_id = tables[0].get("id")
 
+            # Verify all the columns exist
+            columns = self._request("get", f"workbook/worksheets/{self.stream_name}/tables/{self.table_id}/columns").json().get("value")
+            columns = [c['name'] for c in columns]
+            columns_to_add = [c for c in header if c not in columns]
+
+            # Create any missing columns
+            for c in columns_to_add:
+                resp = self._request("post", f"workbook/worksheets/{self.stream_name}/tables/{self.table_id}/columns/add", request_data={
+                    "name": c
+                }).json()
+
+        # In order to ensure the order of the header matches the order in spreadsheet, we refetch from excel
+        columns = self._request("get", f"workbook/worksheets/{self.stream_name}/tables/{self.table_id}/columns").json().get("value")
+        # TODO: I believe Excel will always return this in order, but we may need to sort by index if not
+        header = [c['name'] for c in columns]
+
+        # If there's a primary key we need to delete the old records before we post the new ones
+        if self.key_properties:
+            # TODO: This only supports a single key!
+            key = self.key_properties[0]
+            key_index = header.index(key)
+
+            # Get the existing records
+            rows = self._request("get", f"workbook/worksheets/{self.stream_name}/tables/{self.table_id}/rows").json()['value']
+            for r in rows:
+                key_val = r['values'][0][key_index]
+                matching_row = next((x for x in records if x[key] == key_val), None)
+                if matching_row:
+                    # Update the existing row
+                    resp = self._request("patch", f"workbook/worksheets/{self.stream_name}/tables/{self.table_id}/rows/itemAt(index={r['index']})", request_data={
+                        "values": [self.convert_row(header, matching_row)]
+                    })
+                    # Now we can safely remove the row from the master array
+                    records.remove(matching_row)
+
+                    # If we're out of records to post, return!
+                    if len(records) == 0:
+                        return resp
+
         # Create the records
-        records = [list(r.values()) for r in records]
+        records = [self.convert_row(header, r) for r in records]
         resp = self._request("post", f"workbook/worksheets/{self.stream_name}/tables/{self.table_id}/rows", request_data={
             "values": records
         })
